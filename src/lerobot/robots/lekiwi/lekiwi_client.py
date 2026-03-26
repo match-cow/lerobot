@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 from functools import cached_property
+from functools import partial
 
 import cv2
 import numpy as np
@@ -68,6 +69,9 @@ class LeKiwiClient(Robot):
             {"xy": 0.3, "theta": 90},  # fast
         ]
         self.speed_index = 0  # Start at slow
+        self.node = None
+        self.spin_thread = None
+        self.twist = None
 
         self._is_connected = False
         self.logs = {}
@@ -113,6 +117,9 @@ class LeKiwiClient(Robot):
     def is_calibrated(self) -> bool:
         pass
 
+    def listener_callback(self, twist):
+        self.twist = twist
+
     @check_if_already_connected
     def connect(self) -> None:
         """Establishes ZMQ sockets with the remote mobile robot"""
@@ -134,6 +141,22 @@ class LeKiwiClient(Robot):
         socks = dict(poller.poll(self.connect_timeout_s * 1000))
         if self.zmq_observation_socket not in socks or socks[self.zmq_observation_socket] != zmq.POLLIN:
             raise DeviceNotConnectedError("Timeout waiting for LeKiwi Host to connect expired.")
+
+        try:
+            import rclpy
+            import threading
+            from geometry_msgs.msg import Twist
+            from rclpy.node import Node
+
+            rclpy.init()
+            self.node = Node("cmd_vel_subscriber")
+            self.node.create_subscription(
+                Twist, "cmd_vel", partial(self.listener_callback), 10
+            )
+            self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
+            self.spin_thread.start()
+        except (ImportError, RuntimeError):
+            logging.warning("ROS 2 imports unavailable, cmd_vel subscription disabled.")
 
         self._is_connected = True
 
@@ -300,6 +323,40 @@ class LeKiwiClient(Robot):
             "theta.vel": theta_cmd,
         }
 
+    def _from_twist_to_base_action(self):
+        if self.twist is None:
+            return None
+
+        speed_setting = self.speed_levels[self.speed_index]
+        xy_speed = speed_setting["xy"]
+        theta_speed = speed_setting["theta"]
+
+        x_cmd = 0.0
+        y_cmd = 0.0
+        theta_cmd = 0.0
+
+        if self.twist.linear.x > 0.1:
+            x_cmd += xy_speed
+        elif self.twist.linear.x < -0.1:
+            x_cmd -= xy_speed
+
+        if self.twist.linear.y > 0.1:
+            y_cmd += xy_speed
+        elif self.twist.linear.y < -0.1:
+            y_cmd -= xy_speed
+
+        if self.twist.angular.z > 0.1:
+            theta_cmd += theta_speed
+        elif self.twist.angular.z < -0.1:
+            theta_cmd -= theta_speed
+
+        self.twist = None
+        return {
+            "x.vel": x_cmd,
+            "y.vel": y_cmd,
+            "theta.vel": theta_cmd,
+        }
+
     def configure(self):
         pass
 
@@ -332,4 +389,11 @@ class LeKiwiClient(Robot):
         self.zmq_observation_socket.close()
         self.zmq_cmd_socket.close()
         self.zmq_context.term()
+        if self.node is not None:
+            import rclpy
+
+            self.node.destroy_node()
+            rclpy.shutdown()
+        if self.spin_thread is not None:
+            self.spin_thread.join()
         self._is_connected = False
